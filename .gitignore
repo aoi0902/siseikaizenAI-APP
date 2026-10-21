@@ -1,0 +1,6 @@
+# 個人データ（実行時に自動生成）
+data/*.db
+
+# Python キャッシュ
+__pycache__/
+*.pyc
