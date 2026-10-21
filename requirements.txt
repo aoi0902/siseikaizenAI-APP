@@ -1,11 +1,17 @@
-# 姿勢改善AI 依存ライブラリ（Python 3.12 / conda 環境 py3_12 で動作確認）
-# 導入: pip install -r requirements.txt
+# 姿勢改善AI 依存ライブラリ（Python 3.12.7 / conda 環境 newPy3_12 で動作確認）
+#
+# 環境の再現手順:
+#   conda create -n newPy3_12 python=3.12.7
+#   conda activate newPy3_12
+#   pip install -r requirements.txt
 #
 # tkinter / sqlite3 / threading は標準ライブラリのため記載しない。
-# numpy は opencv-python・mediapipe・pandas の依存として自動導入される。
+# opencv-contrib-python は mediapipe の依存として自動導入される。
 
+numpy==2.5.0               # 映像フレーム（画像配列）の操作
 opencv-python==4.13.0.92   # カメラ入出力・画像処理・描画
 mediapipe==0.10.35         # 骨格推定（Pose Landmarker タスク）
+PySide6==6.11.1            # GUI（画面・ボタン・映像表示）
 pandas==3.0.3              # 日次スコアの集計
 matplotlib==3.10.9         # スコア推移グラフの作図
 plyer==2.1.0               # デスクトップ通知
