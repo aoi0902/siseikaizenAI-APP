@@ -42,7 +42,10 @@ except ModuleNotFoundError:
 # score      … 0〜100 の点数 ／ 採点不可なら None（scoring.UNSCORABLE）。
 # advice     … 改善提案の文言（悪姿勢時のみ） ／ 提案不要なら None。
 # timestamp  … そのフレームの時刻[ms]（記録・整合の参考）。
-WorkerResult = namedtuple("WorkerResult", ["frame", "landmarks", "score", "advice", "timestamp"])
+# deviations … 特徴ごとの符号付きずれ {名前: 値 or None}（傾向分析の記録用） ／ 採点不可なら None。
+WorkerResult = namedtuple(
+    "WorkerResult", ["frame", "landmarks", "score", "advice", "timestamp", "deviations"]
+)
 
 # キャリブレーション測定の結果（ワーカー→メイン）。保存(DB)はメインが行う。
 CalibrationOutcome = namedtuple(
@@ -149,7 +152,7 @@ class PoseWorker(threading.Thread):
         # core の各処理（薄い指揮者として順番に呼ぶ）。
         from features import extract_features
         from smoothing import FeatureSmoother
-        from scoring import score as score_frame
+        from scoring import score as score_frame, deviations as deviations_of
         from advice import Advisor
         import calibration
 
@@ -194,18 +197,21 @@ class PoseWorker(threading.Thread):
                     # 基準値はメモリ上のものを使う（毎フレームDBを読まない）。
                     baseline = self.get_baseline()
                     sc = score_frame(feats, baseline)
+                    # 「どこが・どちら向きに」ずれたか（DB に残して傾向分析に使う）。
+                    devs = deviations_of(feats, baseline)
                     # 悪姿勢なら改善提案（ヒステリシスで点滅を抑制）。
                     advice = advisor.update(feats, baseline, sc)
                     landmarks = result.landmarks
                 else:
                     sc = None  # 採点不可（UNSCORABLE）
+                    devs = None
                     advice = None
                     advisor.reset()   # 離席したら判定をやり直す
                     smoother.reset()  # 離席したら移動平均もリセット（古い値を引きずらない）
                     landmarks = None
 
                 # 7. 結果をキューに置く（映像は最新優先＝あふれたら古いものを捨てる）。
-                self._put_latest(WorkerResult(frame, landmarks, sc, advice, timestamp_ms))
+                self._put_latest(WorkerResult(frame, landmarks, sc, advice, timestamp_ms, devs))
         finally:
             # 停止時・例外時いずれもカメラと推定器を必ず解放する（メモ §6 終了の順番）。
             if self._estimator is not None:

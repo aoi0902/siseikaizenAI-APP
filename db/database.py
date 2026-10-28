@@ -44,6 +44,12 @@ def _feature_columns():
     return list(config.USE_FEATURES)
 
 
+# scores に付ける「特徴ごとの符号付きずれ」の列名（例: dev_neck_angle）。
+# 傾向分析（core/trend.py）が「どこが・どちら向きに崩れたか」を読むために使う。
+def _deviation_column(feature_name):
+    return _check_identifier(f"dev_{feature_name}")
+
+
 # カラム名は自分たちの config 由来だが、動的にSQL文へ埋め込むので
 # 念のため「単純な識別子」だけを許可する（防御的チェック）。
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -121,6 +127,7 @@ def ensure_tables():
             )
             """
         )
+        _ensure_score_columns(conn)
         conn.commit()
     finally:
         conn.close()
@@ -143,6 +150,19 @@ def _ensure_baseline_columns(conn):
         col = _check_identifier(col)
         if col not in existing:
             conn.execute(f"ALTER TABLE baseline ADD COLUMN {col} REAL")
+
+
+def _ensure_score_columns(conn):
+    """scores に現モードの「符号付きずれ」列を足す（冪等な移行）。
+
+    既存の行は NULL のまま残る（内訳を記録する前のデータ）。
+    傾向分析では、点数だけで出せる指標には使い、崩れ方の内訳からは除外する。
+    """
+    existing = [r["name"] for r in conn.execute("PRAGMA table_info(scores)").fetchall()]
+    for name in _feature_columns():
+        col = _deviation_column(name)
+        if col not in existing:
+            conn.execute(f"ALTER TABLE scores ADD COLUMN {col} REAL")
 
 
 # ── 利用者 ──
@@ -305,13 +325,21 @@ def get_latest_baseline(user_id):
 
 
 # ── スコア（scores） ──
-def save_score(user_id, timestamp, score):
-    """スコアを 1 件記録する。戻り値は追加した行の id。"""
+def save_score(user_id, timestamp, score, deviations=None):
+    """スコアを 1 件記録する。戻り値は追加した行の id。
+
+    deviations … {特徴名: 符号付きずれ or None}（scoring.deviations の出力・任意）。
+                 現モードの特徴だけを dev_<名前> 列へ入れる。
+    """
+    deviations = deviations or {}
+    names = _feature_columns()
+    cols = ", ".join(_deviation_column(n) for n in names)
+    marks = ", ".join("?" for _ in names)
     conn = _connect()
     try:
         cur = conn.execute(
-            "INSERT INTO scores (user_id, timestamp, score) VALUES (?, ?, ?)",
-            (user_id, timestamp, score),
+            f"INSERT INTO scores (user_id, timestamp, score, {cols}) VALUES (?, ?, ?, {marks})",
+            (user_id, timestamp, score, *(deviations.get(n) for n in names)),
         )
         conn.commit()
         return cur.lastrowid
@@ -323,9 +351,10 @@ def get_scores(user_id, start=None, end=None):
     """スコアの生の記録を時刻順に返す（集計はしない＝ pandas の役目）。
 
     start / end … 期間で絞りたいときの文字列日時（任意）。
-    戻り値      … [{"timestamp": ..., "score": ...}, ...]
+    戻り値      … [{"timestamp": ..., "score": ..., "dev_<特徴名>": ... or None}, ...]
     """
-    sql = "SELECT timestamp, score FROM scores WHERE user_id = ?"
+    dev_cols = "".join(f", {_deviation_column(n)}" for n in _feature_columns())
+    sql = f"SELECT timestamp, score{dev_cols} FROM scores WHERE user_id = ?"
     params = [user_id]
     if start is not None:
         sql += " AND timestamp >= ?"
@@ -410,6 +439,16 @@ def _self_test():
         all_scores = get_scores(uid)
         day19 = get_scores(uid, start="2026-06-19 00:00:00", end="2026-06-19 23:59:59")
         print(f"get_scores: 全{len(all_scores)}件 / 6/19のみ{len(day19)}件  ← 3件 / 2件 のはず")
+
+        # 内訳つきで保存 → dev_ 列で読める。内訳なしの行は NULL(None)
+        save_score(uid, "2026-06-21 10:00:00", 50.0,
+                   deviations={"neck_angle": -1.5, "trunk_angle": None})
+        rows = get_scores(uid)
+        assert rows[-1]["dev_neck_angle"] == -1.5 and rows[-1]["dev_trunk_angle"] is None
+        assert rows[0]["dev_neck_angle"] is None
+        # 再起動を模して ensure_tables を再実行しても壊れない（移行の冪等性）
+        ensure_tables()
+        print("scores の内訳列: 保存・取得・移行の冪等性 OK")
 
         print("DB 自己テスト: すべて OK")
     finally:

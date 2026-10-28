@@ -107,6 +107,32 @@ def score(
     return _deviation_to_score(total_deviation, deadband, decay)
 
 
+def deviations(current_features, baseline, use_features=None, tolerance=None):
+    """特徴ごとの「符号付き」ずれ（許容幅の何倍か）を返す。傾向分析の記録用。
+
+    score() と同じ物差し (現在値 − 基準値) / 許容幅 だが、絶対値を取らず符号を残す。
+    符号があれば、あとから「基準より小さい(low)/大きい(high)」＝崩れの向きを復元できる。
+
+    戻り値: {特徴名: ずれ or None(無効)} ／ 基準値が無ければ None。
+    """
+    use_features = config.USE_FEATURES if use_features is None else use_features
+    tolerance = config.TOLERANCE if tolerance is None else tolerance
+    if baseline is None:
+        return None
+
+    result = {}
+    for name in use_features:
+        feat = current_features.get(name)
+        base_val = baseline.get(name)
+        tol = tolerance.get(name)
+        if (feat is None or not feat.valid or feat.value is None
+                or base_val is None or tol is None or tol <= _EPS):
+            result[name] = None
+            continue
+        result[name] = (feat.value - base_val) / tol
+    return result
+
+
 def _deviation_to_score(total_deviation, deadband, decay):
     """総合ずれ → 0〜100 点。
 
@@ -175,6 +201,14 @@ def _self_test():
     # ⑦ 有効特徴ゼロ → 採点不可
     both_invalid = feats(80.0, 5.0, neck_valid=False, trunk_valid=False)
     print(f"有効特徴ゼロ : {sc(both_invalid)}  ← None のはず")
+
+    # ⑧ 符号付きずれ（傾向分析の記録用）: 首が基準より小さい→負、無効→None
+    devs = deviations(feats(55.0, 5.0, trunk_valid=False), baseline,
+                      use_features=["neck_angle", "trunk_angle"],
+                      tolerance={"neck_angle": 12.0, "trunk_angle": 12.0})
+    assert devs["neck_angle"] < 0 and devs["trunk_angle"] is None, devs
+    assert deviations(feats(80.0, 5.0), None) is None
+    print(f"符号付きずれ : {devs}  ← neck は負・trunk は None")
 
 
 if __name__ == "__main__":

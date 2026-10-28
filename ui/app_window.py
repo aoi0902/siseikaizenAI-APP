@@ -128,6 +128,8 @@ class AppWindow:
         self.home_page = None
         self.capture_page = None
         self.feedback_page = None
+        self.trend_page = None    # 傾向フィードバック画面
+        self.trend_label = None   # 傾向フィードバックの文章
         self.manage_page = None   # キャリブレーションデータの管理画面
         self.live_view = None
         self.calibration_view = None
@@ -241,10 +243,12 @@ class AppWindow:
         self.home_page = self._build_home_page()
         self.capture_page = self._build_capture_page()
         self.feedback_page = self._build_feedback_page()
+        self.trend_page = self._build_trend_page()
         self.manage_page = self._build_manage_page()
         self.stack.addWidget(self.home_page)
         self.stack.addWidget(self.capture_page)
         self.stack.addWidget(self.feedback_page)
+        self.stack.addWidget(self.trend_page)
         self.stack.addWidget(self.manage_page)
 
         self.stack.setCurrentWidget(self.home_page)  # 最初はホーム
@@ -283,6 +287,13 @@ class AppWindow:
         btn_feedback.setMinimumHeight(56)
         btn_feedback.clicked.connect(self.go_feedback)
         layout.addWidget(btn_feedback)
+
+        # 「傾向フィードバック」→ 記録から姿勢のクセを読み取って文章で返す画面へ。
+        btn_trend = QPushButton("傾向フィードバック")
+        btn_trend.setFont(_ui_font(16))
+        btn_trend.setMinimumHeight(56)
+        btn_trend.clicked.connect(self.go_trend)
+        layout.addWidget(btn_trend)
 
         # 「キャリブレーションの管理」→ 名前変更・削除の画面へ。
         btn_manage = QPushButton("キャリブレーションの管理")
@@ -392,6 +403,40 @@ class AppWindow:
         layout.addWidget(btn_home)
         return page
 
+    # ── 傾向フィードバック画面 ──
+    def _build_trend_page(self):
+        """生成ボタン＋フィードバック文＋ホームへ戻るボタンを作って返す。"""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        title = QLabel("傾向フィードバック")
+        title.setFont(_ui_font(18, bold=True))
+        layout.addWidget(title)
+        layout.addWidget(QLabel(f"直近{config.TREND_DAYS}日間の記録から、姿勢のクセを読み取ります。"))
+
+        btn_generate = QPushButton("フィードバックを生成")
+        btn_generate.setFont(_ui_font(14))
+        btn_generate.setMinimumHeight(44)
+        btn_generate.clicked.connect(self.on_generate_trend)
+        layout.addWidget(btn_generate)
+
+        # 結果の文章（折り返し・選択コピー可）。
+        self.trend_label = QLabel("「フィードバックを生成」を押してください。")
+        self.trend_label.setFont(_ui_font(13))
+        self.trend_label.setWordWrap(True)
+        self.trend_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.trend_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self.trend_label, 1)
+
+        btn_home = QPushButton("ホームへ戻る")
+        btn_home.setMinimumHeight(36)
+        btn_home.clicked.connect(self.go_home)
+        layout.addWidget(btn_home)
+        return page
+
     # ── キャリブレーション管理画面（名前変更・削除） ──
     def _build_manage_page(self):
         """保存済みキャリブレーションの一覧＋名前変更・削除・戻るボタンを作って返す。"""
@@ -446,6 +491,10 @@ class AppWindow:
         if self.feedback_view is not None:
             self.feedback_view.refresh()
         self.stack.setCurrentWidget(self.feedback_page)
+
+    def go_trend(self):
+        """傾向フィードバック画面へ（生成は利用者がボタンを押したときだけ）。"""
+        self.stack.setCurrentWidget(self.trend_page)
 
     def go_manage(self):
         """管理画面へ。最新の一覧を作り直してから表示する。"""
@@ -609,7 +658,9 @@ class AppWindow:
                 if self._score_counter >= self.save_score_every:
                     self._score_counter = 0
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    self.database.save_score(self.user_id, ts, item.score)
+                    # 内訳（特徴ごとのずれ）も一緒に残す → 傾向フィードバックで使う。
+                    self.database.save_score(self.user_id, ts, item.score,
+                                             deviations=item.deviations)
 
             last = item
         return last
@@ -734,6 +785,25 @@ class AppWindow:
         if self.feedback_view is not None:
             self.feedback_view.refresh()
 
+    # ── 傾向フィードバックの生成（オンデマンド） ──
+    def on_generate_trend(self):
+        """記録を読んで傾向を分析し、文章を表示する。
+
+        集計は数十万行でも pandas で1秒未満なのでメインスレッドで同期実行する
+        （DB に触るのはメインだけ、という方針もそのまま守れる）。
+        """
+        import trend
+        from datetime import timedelta
+
+        now = datetime.now()
+        # 比較に使う「前の期間」まで含めて読む（それより古い記録は読まない）。
+        start = (now - timedelta(days=2 * config.TREND_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+        rows = self.database.get_scores(self.user_id, start=start)
+        text = trend.generate(rows, now)
+        if self.trend_label is not None:
+            self.trend_label.setText(f"{now:%Y-%m-%d %H:%M} 生成\n\n{text}")
+        return text
+
     # ── 終了 ──
     def on_close(self):
         """停止フラグ → QTimer停止 → ワーカー join → 解放。
@@ -763,7 +833,9 @@ def main():
 # ── 単体での動作確認（ディスプレイ不要。統合ロジックを偽部品で検証） ──
 def _self_test():
     from collections import namedtuple
-    WorkerResult = namedtuple("WorkerResult", ["frame", "landmarks", "score", "timestamp"])
+    WorkerResult = namedtuple("WorkerResult",
+                              ["frame", "landmarks", "score", "timestamp", "deviations"],
+                              defaults=[None])
     Outcome = namedtuple("Outcome", ["success", "user_id", "representative", "num_samples", "message"])
 
     class FakeDB:
@@ -774,7 +846,9 @@ def _self_test():
         def get_or_create_user(self, name): return 1
         def get_latest_baseline(self, uid):
             return {"neck_angle": 10.0, "shoulder_tilt": 0.0} if self.saved_baselines else None
-        def save_score(self, uid, ts, score): self.saved_scores.append((uid, ts, score))
+        def save_score(self, uid, ts, score, deviations=None):
+            self.saved_scores.append((uid, ts, score, deviations))
+        def get_scores(self, uid, start=None, end=None): return []
         def save_baseline(self, uid, rep, ts, name=None):
             self.saved_baselines.append((uid, rep, ts, name))
         def get_baseline_names(self, uid):
@@ -813,7 +887,7 @@ def _self_test():
         WorkerResult("f1", None, 95.0, 1),
         WorkerResult("f2", None, 80.0, 2),
         WorkerResult("f3", None, None, 3),   # 採点不可
-        WorkerResult("f4", None, 70.0, 4),
+        WorkerResult("f4", None, 70.0, 4, {"neck_angle": -1.2}),
         WorkerResult("f5", None, 60.0, 5),
     ]
     last = app._dispatch_results(items)
@@ -821,6 +895,10 @@ def _self_test():
     # 数値スコアは4件、save_score_every=3 なので 3件目で1回だけ記録される
     results.append(("スコア記録が間引かれる(数値4件→1回)", len(db.saved_scores) == 1))
     results.append(("描画用に最後の1件を返す", last.frame == "f5"))
+    results.append(("記録に内訳(ずれ)も渡す", db.saved_scores[0][3] == {"neck_angle": -1.2}))
+
+    # ①' 傾向フィードバック: 記録が無くても落ちず、不足の案内を返す
+    results.append(("傾向生成(記録なし)で案内文", "足りません" in app.on_generate_trend()))
 
     # ② キャリブ結果の処理: 成功 → save_baseline & set_baseline
     outcome = Outcome(True, 1, {"neck_angle": 12.0, "shoulder_tilt": -1.0}, 50, "完了")
