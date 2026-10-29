@@ -190,7 +190,9 @@ class PoseWorker(threading.Thread):
 
                 # 4〜6. 検出なしは採点しない。検出ありなら特徴量→平滑化→採点→改善提案。
                 if result.detected:
-                    feats = extract_features(result.landmarks)
+                    # 縦横比は実フレームから測る（カメラが希望解像度を無視することがあるため）。
+                    feats = extract_features(result.landmarks,
+                                             aspect=frame.shape[1] / frame.shape[0])
                     # 体幹の傾き等を直近数フレームの平均でならしてから採点する
                     # （1フレームの震えでスコアや提案がチラつくのを防ぐ）。
                     feats = smoother.smooth(feats)
@@ -264,6 +266,10 @@ class PoseWorker(threading.Thread):
 # ── 単体での動作確認（にせカメラ・にせ推定器。本物のカメラ/モデル不要） ──
 def _self_test():
     from types import SimpleNamespace
+    import numpy as np
+
+    # 本物のカメラと同じく画像配列を返す（ワーカーは frame.shape から縦横比を測るため）。
+    FRAME = np.zeros((480, 640, 3), dtype=np.uint8)
     from features import extract_features
 
     # pose.py が返す形（x,y,z,visibility）の偽ランドマーク（まっすぐ座った想定）。
@@ -280,7 +286,7 @@ def _self_test():
         def __init__(self):
             self.released = False
         def read_frame(self):
-            return True, "FRAME"
+            return True, FRAME
         def release(self):
             self.released = True
 
@@ -293,7 +299,8 @@ def _self_test():
             self.closed = True
 
     # まっすぐ姿勢から基準値を作る（同じ姿勢なので採点は満点近くになるはず）。
-    feats = extract_features(upright())
+    # 基準値もワーカーと同じ縦横比で測る（物差しがずれると一致姿勢でも減点される）。
+    feats = extract_features(upright(), aspect=FRAME.shape[1] / FRAME.shape[0])
     baseline = {n: feats[n].value for n in config.USE_FEATURES}
 
     cam, est = FakeCamera(), FakeEstimator()
@@ -324,7 +331,7 @@ def _self_test():
             except queue.Empty:
                 pass
         results.append(("ワーカーが点数をキューに流す", len(scores) > 0))
-        results.append(("最新フレームが取り出せる", last_frame == "FRAME"))
+        results.append(("最新フレームが取り出せる", last_frame is FRAME))
         results.append(("一致姿勢で高得点(>90)", bool(scores) and all(s is not None and s > 90 for s in scores)))
 
         # キャリブレーションをワーカー経由で要求 → カメラを奪い合わずに完了。

@@ -86,7 +86,9 @@ def collect_samples(camera, estimator, seconds=None, use_features=None,
         if not result.detected:
             continue  # 検出なしは捨てる
 
-        feats = extract_features(result.landmarks, use_features, min_visibility)
+        # 採点（pose_worker）と同じく実フレームの縦横比で補正する（基準値と現在値の物差しをそろえる）。
+        feats = extract_features(result.landmarks, use_features, min_visibility,
+                                 aspect=frame.shape[1] / frame.shape[0])
         # 使う特徴がすべて信用できるフレームだけ採用する。
         if all(feats[name].valid for name in use_features):
             good_samples.append({name: feats[name].value for name in use_features})

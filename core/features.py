@@ -54,6 +54,9 @@ except ModuleNotFoundError:
 Feature = namedtuple("Feature", ["value", "valid"])
 INVALID = Feature(value=None, valid=False)
 
+# 縦横比を補正した点（x だけ伸ばした新しい点。元の landmarks は書き換えない）。
+_Point = namedtuple("_Point", ["x", "y", "z", "visibility"])
+
 # 割る量がこれ未満なら（点が重なる等）向きが定まらないとみなして無効。
 _EPS = 1e-6
 
@@ -220,13 +223,19 @@ _FRONT_FEATURE_FUNCS = {
 
 
 # ── 公開インターフェース ──
-def extract_features(landmarks, use_features=None, min_visibility=None):
+def extract_features(landmarks, use_features=None, min_visibility=None, aspect=1.0):
     """33点（正規化）から、名前つきの特徴量＋有効フラグを返す（モードで式が変わる）。
 
     引数:
       landmarks      … pose.py が返した 33点（各点 x,y,z,visibility）
       use_features   … 使う特徴名のリスト（省略時 config.USE_FEATURES）
       min_visibility … 信用する最低 visibility（省略時 config.MIN_VISIBILITY）
+      aspect         … フレームの 幅/高さ（例 640/480）。呼び出し側が frame から渡す。
+                       MediaPipe は x を幅・y を高さで別々に割って正規化するため、
+                       そのまま角度を測ると縦横比ぶんゆがむ。x に aspect を掛けると
+                       画素座標を高さで割ったのと同じ座標になり、角度が画素と一致する
+                       （角度は全体を同じ倍率で縮めても変わらないため）。
+                       基準値と現在値は必ず同じ aspect で測ること。
 
     戻り値: {特徴名: Feature(value, valid), ...}
       必要な点が低 visibility 等のときは valid=False で返す。
@@ -241,6 +250,11 @@ def extract_features(landmarks, use_features=None, min_visibility=None):
     # 点数が足りない入力は、全特徴を無効にして安全に返す。
     if landmarks is None or len(landmarks) < config.NUM_LANDMARKS:
         return {name: INVALID for name in use_features}
+
+    # 縦横比の補正は入口の1か所で行う（5つの特徴量の式はどれも x,y しか使わないので、
+    # 座標系をそろえれば式には手を入れずに済む）。
+    if aspect != 1.0:
+        landmarks = [_Point(lm.x * aspect, lm.y, lm.z, lm.visibility) for lm in landmarks]
 
     # モードに応じて特徴量を計算する。
     if getattr(config, "POSTURE_MODE", "side") == "front":
@@ -306,6 +320,17 @@ def _test_side():
     f = extract_features(make("left", ear=(0.5, 0.25), shoulder=(0.5, 0.45), hip=(0.5, 0.75),
                               seen_vis=0.1, hidden_vis=0.05), uf)
     results.append(("低信頼は無効", f["neck_angle"].valid is False and f["trunk_angle"].valid is False))
+
+    # ⑦ 縦横比の補正: 画素座標で neck=50° の姿勢を 640x480 で正規化して渡す
+    #    （耳は肩から 横100px・上 100*tan50°px）。補正ありで 50°、なしでは縦に伸びて約58°。
+    w, h = 640, 480
+    up = 100 * math.tan(math.radians(50))
+    px = make("left", ear=(420 / w, (300 - up) / h), shoulder=(320 / w, 300 / h), hip=(320 / w, 450 / h))
+    corrected = extract_features(px, uf, aspect=w / h)["neck_angle"].value
+    raw = extract_features(px, uf)["neck_angle"].value
+    results.append(("縦横比の補正で画素どおりの角度(50°)", abs(corrected - 50.0) < 0.01))
+    results.append(("補正なしは縦に伸びた角度(約58°)", abs(raw - 57.8) < 0.1))
+    results.append(("補正しても入力の点は書き換えない", px[_LEFT_SIDE.ear].x == 420 / w))
     return results
 
 
