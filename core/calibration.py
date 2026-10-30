@@ -57,15 +57,19 @@ def collect_samples(camera, estimator, seconds=None, use_features=None,
       採点ループと推定器を共有する場合は、共通の単調増加カウンタを渡すこと。
       渡さないと推定器のタイムスタンプが逆戻りし VIDEO モードがエラーになる。
 
-    戻り値: (good_samples, total_frames)
+    戻り値: (good_samples, total_frames, raw_frames)
       good_samples … [{特徴名: 値, ...}, ...]（採用したフレームぶん）
       total_frames … 走らせた総フレーム数（除外率の確認用）
+      raw_frames   … 検出できた全フレームの生の座標（除外したフレームも含む）。
+                     [{"captured_at", "points", "width", "height"}, ...]
+                     除外も含めるのは、式や閾値を変えたとき「どれが良いフレームか」から再計算するため
     """
     seconds = config.CALIBRATION_SECONDS if seconds is None else seconds
     use_features = config.USE_FEATURES if use_features is None else use_features
     min_visibility = config.MIN_VISIBILITY if min_visibility is None else min_visibility
 
     good_samples = []
+    raw_frames = []
     total_frames = 0
     timestamp_ms = 0
     start = time.perf_counter()
@@ -86,6 +90,10 @@ def collect_samples(camera, estimator, seconds=None, use_features=None,
         if not result.detected:
             continue  # 検出なしは捨てる
 
+        height, width = frame.shape[:2]
+        raw_frames.append({"captured_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                           "points": result.landmarks, "width": width, "height": height})
+
         # 採点（pose_worker）と同じく実フレームの縦横比で補正する（基準値と現在値の物差しをそろえる）。
         feats = extract_features(result.landmarks, use_features, min_visibility,
                                  aspect=frame.shape[1] / frame.shape[0])
@@ -93,7 +101,7 @@ def collect_samples(camera, estimator, seconds=None, use_features=None,
         if all(feats[name].valid for name in use_features):
             good_samples.append({name: feats[name].value for name in use_features})
 
-    return good_samples, total_frames
+    return good_samples, total_frames, raw_frames
 
 
 # ── 内部: 安定化（純粋関数・カメラ/DB不要） ──
@@ -147,7 +155,7 @@ def run_calibration(user_id, camera=None, estimator=None):
 
     try:
         # 1. 良いフレームを集める
-        good_samples, total = collect_samples(camera, estimator)
+        good_samples, total, raw_frames = collect_samples(camera, estimator)
 
         # 2. 最低サンプル数チェック（中途半端な基準値を作らない）
         if len(good_samples) < config.MIN_GOOD_SAMPLES:
@@ -166,7 +174,7 @@ def run_calibration(user_id, camera=None, estimator=None):
 
         # 4. 保存（SQL は書かない。database.py に委ねる）
         measured_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        database.save_baseline(user_id, representative, measured_at)
+        database.save_baseline(user_id, representative, measured_at, frames=raw_frames)
 
         # 5. 読み戻し確認（保存しっぱなしにせず妥当性を確かめる）
         saved = database.get_latest_baseline(user_id)

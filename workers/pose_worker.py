@@ -48,8 +48,10 @@ WorkerResult = namedtuple(
 )
 
 # キャリブレーション測定の結果（ワーカー→メイン）。保存(DB)はメインが行う。
+# frames … 測定中に検出した全フレームの生の座標（DB の landmarks に baseline と一緒に保存する）。
 CalibrationOutcome = namedtuple(
-    "CalibrationOutcome", ["success", "user_id", "representative", "num_samples", "message"]
+    "CalibrationOutcome",
+    ["success", "user_id", "representative", "num_samples", "message", "frames"]
 )
 
 # 連続でフレーム取得に失敗したらカメラ切断とみなして安全に抜ける。
@@ -229,7 +231,7 @@ class PoseWorker(threading.Thread):
         """
         # タイムスタンプは採点ループと同じ単調増加カウンタを使う（推定器を共有するため、
         # 0 にリセットすると VIDEO モードが「時刻が逆戻り」でエラーになる）。
-        good_samples, total = calibration.collect_samples(
+        good_samples, total, raw_frames = calibration.collect_samples(
             self._camera, self._estimator, timestamp_fn=self._next_timestamp)
         if len(good_samples) < config.MIN_GOOD_SAMPLES:
             self.calib_result_queue.put(CalibrationOutcome(
@@ -238,6 +240,7 @@ class PoseWorker(threading.Thread):
                 message=(f"良いフレームが不足しています"
                          f"（{len(good_samples)}/{config.MIN_GOOD_SAMPLES}、総{total}）。"
                          "正しい姿勢で動かずにもう一度お試しください。"),
+                frames=None,  # 失敗した測定は基準値を作らないので座標も残さない
             ))
             return
 
@@ -245,6 +248,7 @@ class PoseWorker(threading.Thread):
         self.calib_result_queue.put(CalibrationOutcome(
             success=True, user_id=user_id, representative=representative,
             num_samples=len(good_samples), message="キャリブレーション完了。",
+            frames=raw_frames,
         ))
 
     # ── 結果をキューへ（映像は最新だけ・あふれたら古いものを捨てる、メモ §4/§14） ──
@@ -350,6 +354,24 @@ def _self_test():
             except queue.Empty:
                 pass
         results.append(("キャリブがワーカー経由で完了", outcome is not None and outcome.success))
+
+        # 生の座標が残り、そこから特徴量を再計算すると基準値と一致する（landmarks 保存の目的そのもの）。
+        frames = outcome.frames if outcome is not None else None
+        recomputed = None
+        if frames:
+            import calibration
+            samples = []
+            for fr in frames:
+                f = extract_features(fr["points"], aspect=fr["width"] / fr["height"])
+                if all(f[n].valid for n in config.USE_FEATURES):
+                    samples.append({n: f[n].value for n in config.USE_FEATURES})
+            recomputed = calibration.stabilize(samples)
+        results.append(("キャリブの生の座標が残る(画像サイズつき)",
+                        bool(frames) and frames[0]["width"] == 640 and frames[0]["height"] == 480))
+        results.append(("座標から再計算した値が基準値と一致",
+                        recomputed is not None and all(
+                            abs(recomputed[n] - outcome.representative[n]) < 1e-9
+                            for n in config.USE_FEATURES)))
 
         # 停止フラグでワーカーが素早く止まり、カメラが解放される。
         t0 = time.time()

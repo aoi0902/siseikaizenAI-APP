@@ -129,6 +129,8 @@ STABILIZE_METHOD = "median"   # 安定化の方法。"median"（外れ値に強�
 DB_PATH = os.path.join(BASE_DIR, "data", "posture.db")  # DBファイル本体の場所
 DB_BUSY_TIMEOUT_MS = 5000   # ロック時に待つ時間[ms]（複数接続が重なった時の保険）
 DB_USE_WAL = False          # WALモード。推奨案（メインだけが触る）では不要なので既定OFF
+# landmarks（生の座標）を保存するときの小数の桁数。MediaPipe の座標精度に対して 6 桁あれば情報は失われない。
+LANDMARK_DECIMALS = 6
 
 
 # ── 採点設定（core/scoring.py が参照） ──

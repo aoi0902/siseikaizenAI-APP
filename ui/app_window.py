@@ -137,6 +137,7 @@ class AppWindow:
         self.session_view = None  # 今回のスコア推移グラフ
         self.score_label = None
         self.capture_button = None  # 撮影 ON/OFF トグル
+        self.record_checkbox = None  # 記録モード（実験用）の ON/OFF
         self.calib_selector = None  # 使用するキャリブレーション（名前で選ぶ）
         self.manage_list = None     # 管理画面のキャリブ一覧
         self.manage_status = None   # 管理画面の操作結果表示
@@ -148,6 +149,7 @@ class AppWindow:
 
         # 内部状態
         self._score_counter = 0   # スコア記録の間引きカウンタ
+        self.recording = False    # 記録モード: ON の間だけ生の座標も保存する
         self.capturing = False    # 撮影（カメラ・ワーカー）が動いているか
         self._closing = False
 
@@ -200,6 +202,10 @@ class AppWindow:
         if self.score_label is not None:
             self.score_label.setText("撮影停止中")
         self._update_capture_button()
+
+    def _on_toggle_recording(self, checked):
+        """記録モードのチェックボックスに合わせて、生の座標を保存するかを切り替える。"""
+        self.recording = bool(checked)
 
     def toggle_capture(self):
         """撮影 ON/OFF を切り替える（撮影画面のトグルボタンから）。"""
@@ -315,7 +321,7 @@ class AppWindow:
         """
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-                                       QPushButton, QComboBox)
+                                       QPushButton, QComboBox, QCheckBox)
         from live_view import LiveView
         from calibration_view import CalibrationView
         from session_view import SessionChartView
@@ -364,6 +370,12 @@ class AppWindow:
         self.capture_button.setMinimumHeight(44)
         self.capture_button.clicked.connect(self.toggle_capture)
         right.addWidget(self.capture_button)
+
+        # 記録モード（実験用）: ON の間だけ、スコアと同じタイミングで生の座標も保存する。
+        # 常時保存すると DB が膨らむため実験中だけ使う。画面に状態が見えるので入れ忘れに気づける。
+        self.record_checkbox = QCheckBox("記録モード（実験用：座標も保存）")
+        self.record_checkbox.toggled.connect(self._on_toggle_recording)
+        right.addWidget(self.record_checkbox)
 
         # ホームへ戻る（戻るときはカメラを解放する）。
         btn_home = QPushButton("ホームへ戻る")
@@ -658,9 +670,15 @@ class AppWindow:
                 if self._score_counter >= self.save_score_every:
                     self._score_counter = 0
                     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    # 記録モード（実験用）のときだけ、その瞬間の生の座標と画像サイズも残す。
+                    landmarks, image_size = None, None
+                    if self.recording and item.landmarks is not None:
+                        landmarks = item.landmarks
+                        image_size = (item.frame.shape[1], item.frame.shape[0])
                     # 内訳（特徴ごとのずれ）も一緒に残す → 傾向フィードバックで使う。
                     self.database.save_score(self.user_id, ts, item.score,
-                                             deviations=item.deviations)
+                                             deviations=item.deviations,
+                                             landmarks=landmarks, image_size=image_size)
 
             last = item
         return last
@@ -710,7 +728,9 @@ class AppWindow:
                 return outcome
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # DB に触るのはメインだけ。保存 → 名前で読み戻し → ワーカーへ差し替え。
-            self.database.save_baseline(outcome.user_id, outcome.representative, ts, name=name)
+            # 測定中の生の座標も一緒に保存する（式を直したとき、測り直さずに再計算できるように）。
+            self.database.save_baseline(outcome.user_id, outcome.representative, ts, name=name,
+                                        frames=outcome.frames)
             baseline = self.database.get_baseline_by_name(outcome.user_id, name)
             # メモリの基準値も更新（撮影を止めて再開したとき新しい基準値を使うため）。
             self.baseline = baseline
@@ -836,7 +856,9 @@ def _self_test():
     WorkerResult = namedtuple("WorkerResult",
                               ["frame", "landmarks", "score", "timestamp", "deviations"],
                               defaults=[None])
-    Outcome = namedtuple("Outcome", ["success", "user_id", "representative", "num_samples", "message"])
+    Outcome = namedtuple("Outcome",
+                         ["success", "user_id", "representative", "num_samples", "message", "frames"],
+                         defaults=[None])
 
     class FakeDB:
         def __init__(self):
@@ -846,11 +868,12 @@ def _self_test():
         def get_or_create_user(self, name): return 1
         def get_latest_baseline(self, uid):
             return {"neck_angle": 10.0, "shoulder_tilt": 0.0} if self.saved_baselines else None
-        def save_score(self, uid, ts, score, deviations=None):
-            self.saved_scores.append((uid, ts, score, deviations))
+        def save_score(self, uid, ts, score, deviations=None, landmarks=None, image_size=None):
+            self.saved_scores.append((uid, ts, score, deviations, landmarks, image_size))
         def get_scores(self, uid, start=None, end=None): return []
-        def save_baseline(self, uid, rep, ts, name=None):
+        def save_baseline(self, uid, rep, ts, name=None, frames=None):
             self.saved_baselines.append((uid, rep, ts, name))
+            self.saved_frames = frames
         def get_baseline_names(self, uid):
             return [{"name": n, "measured_at": ts} for (_, _, ts, n) in self.saved_baselines if n]
         def get_baseline_by_name(self, uid, name):
@@ -896,14 +919,27 @@ def _self_test():
     results.append(("スコア記録が間引かれる(数値4件→1回)", len(db.saved_scores) == 1))
     results.append(("描画用に最後の1件を返す", last.frame == "f5"))
     results.append(("記録に内訳(ずれ)も渡す", db.saved_scores[0][3] == {"neck_angle": -1.2}))
+    results.append(("記録モードOFFでは座標を保存しない", db.saved_scores[0][4] is None))
+
+    # ①'' 記録モードON: スコアと一緒に座標と画像サイズ(幅, 高さ)を渡す
+    import numpy as np
+    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+    app._on_toggle_recording(True)
+    app._score_counter = 0
+    app._dispatch_results([WorkerResult(frame, ["LM"] * 33, 75.0, 6)] * 3)
+    results.append(("記録モードONで座標と画像サイズも保存",
+                    db.saved_scores[-1][4] == ["LM"] * 33 and db.saved_scores[-1][5] == (640, 480)))
+    app._on_toggle_recording(False)
 
     # ①' 傾向フィードバック: 記録が無くても落ちず、不足の案内を返す
     results.append(("傾向生成(記録なし)で案内文", "足りません" in app.on_generate_trend()))
 
     # ② キャリブ結果の処理: 成功 → save_baseline & set_baseline
-    outcome = Outcome(True, 1, {"neck_angle": 12.0, "shoulder_tilt": -1.0}, 50, "完了")
+    outcome = Outcome(True, 1, {"neck_angle": 12.0, "shoulder_tilt": -1.0}, 50, "完了",
+                      frames=[{"captured_at": "t", "points": [], "width": 640, "height": 480}])
     app._handle_calib_outcome(outcome)
     results.append(("キャリブ成功で基準値を保存", len(db.saved_baselines) == 1))
+    results.append(("キャリブの座標も一緒に保存", db.saved_frames == outcome.frames))
     results.append(("ワーカーの基準値を差し替え", app.worker.baseline is not None))
 
     # ②' 保存キャンセル: 名前入力を None にすると保存されず、基準値も変わらない
