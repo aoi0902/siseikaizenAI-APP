@@ -13,8 +13,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── カメラ設定（core/capture.py が参照） ──
 CAMERA_INDEX = 1       # 使うカメラの番号。0=内蔵 / 1=外付け webカメラ
-FRAME_WIDTH = 640      # 希望する横解像度[px]
-FRAME_HEIGHT = 480     # 希望する縦解像度[px]
+FRAME_WIDTH = 1280     # 希望する横解像度[px]（実験Bの手動計測の精度のため 1280x720。撮影プロトコル準拠）
+FRAME_HEIGHT = 720     # 希望する縦解像度[px]
 TARGET_FPS = 30        # 希望するフレームレート[fps]
 MIRROR = True          # 左右反転して鏡のように見せるか
 
@@ -242,7 +242,7 @@ CALIBRATION_GUIDANCE_TEXT = _by_mode(_SIDE_GUIDANCE_TEXT, _FRONT_GUIDANCE_TEXT)
 
 
 # ── ライブ表示設定（ui/live_view.py が参照） ──
-LIVE_DISPLAY_SIZE = (640, 480)  # 表示する映像の大きさ (幅, 高さ)。小さくすると軽い
+LIVE_DISPLAY_SIZE = (640, 360)  # 表示する映像の大きさ (幅, 高さ)。小さくすると軽い。カメラと同じ縦横比(16:9)にする（違うと映像がゆがんで見える）
 DRAW_SKELETON = True            # 骨格を重ねて描くか
 # 画像変換の方式。"imencode"=Pillow不要(既定)。"pillow"=PIL(ImageTk)を使う（要 Pillow導入）
 IMAGE_BACKEND = "imencode"

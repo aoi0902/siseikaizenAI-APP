@@ -65,12 +65,16 @@ class Camera:
         曖昧に進めず、明確なエラーで停止する。
         """
         # CAP_DSHOW は Windows 向けバックエンド指定。起動が速く安定しやすい。
-        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
-
-        # 解像度・fps は「希望」を伝えるだけ。実際に通るかは機材次第。
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
-        cap.set(cv2.CAP_PROP_FPS, self.target_fps)
+        # 形式・解像度・fps は「開くとき」に渡す。DirectShow は開く時点で受け取り方を決めるため、
+        # 開いた後の set では形式が無視され、非圧縮(YUY2)のままになることがある
+        # （USB2 の帯域では 1280x720 非圧縮は約10fpsが上限。MJPG 圧縮なら30fps出る）。
+        # 解像度・fps は「希望」を伝えるだけ。MJPG 非対応のカメラは使える形式で開かれる。
+        cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW, [
+            cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"),
+            cv2.CAP_PROP_FRAME_WIDTH, self.frame_width,
+            cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height,
+            cv2.CAP_PROP_FPS, self.target_fps,
+        ])
 
         if not cap.isOpened():
             # 後段が空の画像を掴まないよう、ここで止める。
