@@ -2,6 +2,7 @@
 data/*.db
 # 実験データ（被験者が写った画像を含むので GitHub に上げない）
 data/experiment_b/
+data/analysis/
 
 # Python キャッシュ
 __pycache__/
