@@ -1,5 +1,7 @@
 # 個人データ（実行時に自動生成）
 data/*.db
+# 実験データ（被験者が写った画像を含むので GitHub に上げない）
+data/experiment_b/
 
 # Python キャッシュ
 __pycache__/
