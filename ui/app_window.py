@@ -68,6 +68,18 @@ def _parse_window_size(size_text, default=(900, 700)):
         return default
 
 
+def _frames_text(outcome):
+    """キャリブ結果の「採用 N/総 M フレーム（割合）」の文言。総数が無ければ空文字。
+
+    採用率 = 使う特徴がすべて信用できたフレーム ÷ 測定中に読んだ全フレーム（検出なしも含む）。
+    撮影プロトコルの合格基準（80% 以上）と、記録用紙の「採用フレーム数」に使う。
+    """
+    total = getattr(outcome, "total_frames", None)
+    if not total:
+        return ""
+    return f"（採用 {outcome.num_samples}/総 {total} フレーム = {outcome.num_samples / total:.0%}）"
+
+
 def _ui_font(point_size, bold=False):
     """既定のUIフォントを土台に、サイズ・太さだけ変えた QFont を返す。
 
@@ -761,8 +773,8 @@ class AppWindow:
                 self.worker.set_baseline(baseline)
             # 選択肢を作り直し、今保存した名前を選択状態にする。
             self._refresh_calibration_selector(select=name)
-            # 結果メッセージに保存名を添える。
-            message = f"「{name}」として保存しました。"
+            # 結果メッセージに保存名と採用率を添える（記録用紙と撮影プロトコルの 80% 基準の確認用）。
+            message = f"「{name}」として保存しました。" + _frames_text(outcome)
             self._show_calib_result(True, message)
         else:
             self._show_calib_result(False, outcome.message)
@@ -980,6 +992,11 @@ def _self_test():
     app._handle_calib_outcome(outcome)
     results.append(("保存キャンセルでは保存しない", len(db.saved_baselines) == saved_before))
     results.append(("保存キャンセルで基準値は変わらない", app.worker.baseline is baseline_before))
+
+    # ②' 保存成功の文言に添える採用率（総数が無い古い形の結果では付けない）
+    Counted = namedtuple("Counted", ["num_samples", "total_frames"])
+    results.append(("採用率の文言", _frames_text(Counted(50, 60)) == "（採用 50/総 60 フレーム = 83%）"
+                    and _frames_text(Counted(50, None)) == "" and _frames_text(outcome) == ""))
 
     # ②'' 確認画面で「やり直す」: 名前も尋ねず、保存されず、基準値も変わらない
     asked = []

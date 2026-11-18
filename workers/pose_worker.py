@@ -55,11 +55,12 @@ WorkerResult = namedtuple(
 # frames … 測定中に検出した全フレームの生の座標（DB の landmarks に baseline と一緒に保存する）。
 # review_frame … 確認画面に出す画像と座標 {"image", "points", "sample"}（基準値に最も近いフレーム）。
 # warnings … 基準値が目安を外れたときの警告文のリスト（check_baseline の出力）。
+# total_frames … 測定中に読んだ全フレーム数（検出なしも含む）。採用率 = num_samples / total_frames。
 CalibrationOutcome = namedtuple(
     "CalibrationOutcome",
     ["success", "user_id", "representative", "num_samples", "message", "frames",
-     "review_frame", "warnings"],
-    defaults=[None, ()],
+     "review_frame", "warnings", "total_frames"],
+    defaults=[None, (), None],
 )
 
 # 連続でフレーム取得に失敗したらカメラ切断とみなして安全に抜ける。
@@ -273,6 +274,7 @@ class PoseWorker(threading.Thread):
             frames=raw_frames,
             review_frame=calibration.pick_review_frame(candidates, representative),
             warnings=calibration.check_baseline(representative),
+            total_frames=total,
         ))
 
     # ── 結果をキューへ（映像は最新だけ・あふれたら古いものを捨てる、メモ §4/§14） ──
@@ -386,6 +388,8 @@ def _self_test():
                         review is not None and review["image"].shape[1::-1] == config.LIVE_DISPLAY_SIZE))
         results.append(("基準値の警告が結果に付く",
                         outcome is not None and isinstance(outcome.warnings, list)))
+        results.append(("総フレーム数が結果に付く（採用数以上）",
+                        outcome is not None and outcome.total_frames >= outcome.num_samples > 0))
 
         # 生の座標が残り、そこから特徴量を再計算すると基準値と一致する（landmarks 保存の目的そのもの）。
         frames = outcome.frames if outcome is not None else None
