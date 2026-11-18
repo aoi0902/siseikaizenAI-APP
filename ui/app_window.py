@@ -151,6 +151,7 @@ class AppWindow:
         self._score_counter = 0   # スコア記録の間引きカウンタ
         self.recording = False    # 記録モード: ON の間だけ生の座標も保存する
         self.capturing = False    # 撮影（カメラ・ワーカー）が動いているか
+        self._reviewing = False   # キャリブの確認・名前入力の画面を開いている間 True
         self._closing = False
 
     # ── 起動 ──
@@ -623,15 +624,23 @@ class AppWindow:
         if self.worker is None or self.result_queue is None:
             return
 
+        # 確認画面は Qt のイベントループを回すので、開いている間もここに来る。ワーカーはまだ
+        # 古い基準値で採点しているので、その点数を記録・通知しないように捨てる。
+        if self._reviewing:
+            self._drain()
+            return
+
         items = self._drain()
         last = self._dispatch_results(items)
 
         # 最新の1フレームだけ描画し、スコア表示・改善提案も更新する。
         if last is not None:
+            measuring = getattr(last, "measuring", False)
             if self.live_view is not None:
                 self.live_view.update_view(last.frame, last.landmarks, last.score,
-                                           getattr(last, "advice", None))
-            self._update_score_label(last.score)
+                                           getattr(last, "advice", None),
+                                           status="測定中（動かずにキープ）" if measuring else None)
+            self._update_score_label(last.score, measuring)
             # 今回のスコア推移グラフへ供給（採点不可 None も渡す＝線が途切れて離席が分かる）。
             if self.session_view is not None:
                 self.session_view.add_score(last.score)
@@ -683,10 +692,13 @@ class AppWindow:
             last = item
         return last
 
-    def _update_score_label(self, score):
+    def _update_score_label(self, score, measuring=False):
         if self.score_label is None:
             return
-        text = "スコア: 採点不可" if score is None else f"スコア: {score:.0f}"
+        if measuring:
+            text = "スコア: 測定中"
+        else:
+            text = "スコア: 採点不可" if score is None else f"スコア: {score:.0f}"
         self.score_label.setText(text)
 
     # ── キャリブレーション配線 ──
@@ -714,11 +726,22 @@ class AppWindow:
         self._handle_calib_outcome(outcome)
 
     def _handle_calib_outcome(self, outcome):
-        """キャリブ結果に名前を付けて保存する。保存をキャンセルしたらやり直せる。"""
+        """キャリブ結果を本人に確認してもらい、名前を付けて保存する。断ったらやり直せる。"""
         if outcome.success:
-            # 名前を尋ねてから保存する（名前でキャリブを選べるようにするため）。
-            # 利用者がキャンセルしたら None が返る＝この測定結果は保存しない。
-            name = self._ask_calibration_name()
+            self._reviewing = True
+            try:
+                accepted = self._confirm_calibration(outcome)
+                # 名前を尋ねてから保存する（名前でキャリブを選べるようにするため）。
+                # 利用者がキャンセルしたら None が返る＝この測定結果は保存しない。
+                name = self._ask_calibration_name() if accepted else None
+            finally:
+                self._reviewing = False
+            if not accepted:
+                # 確認画面で「やり直す」: 名前入力のキャンセルと同じく、何も変えない。
+                self._show_calib_result(
+                    False,
+                    "保存しませんでした。姿勢を整えて「キャリブレーション開始」からやり直してください。")
+                return outcome
             if name is None:
                 # 保存キャンセル: DB・メモリ基準値・ワーカー・選択肢のいずれも触らないので、
                 # 直前の状態がそのまま保たれる。ボタンを戻してやり直しを促す。
@@ -749,6 +772,14 @@ class AppWindow:
         """calibration_view に結果を伝える（成功/失敗でボタン復帰・色分け表示）。"""
         if self.calibration_view is not None:
             self.calibration_view.show_result(success, message)
+
+    def _confirm_calibration(self, outcome):
+        """測定した姿勢を見せて、保存してよいかを尋ねる（GUI が無いテスト等では確認しない）。"""
+        if self.root is None:
+            return True
+        from calibration_review import review_calibration
+        return review_calibration(self.root, outcome.review_frame, outcome.representative,
+                                  outcome.warnings)
 
     def _ask_calibration_name(self):
         """キャリブレーションの保存名を尋ねる。
@@ -949,6 +980,28 @@ def _self_test():
     app._handle_calib_outcome(outcome)
     results.append(("保存キャンセルでは保存しない", len(db.saved_baselines) == saved_before))
     results.append(("保存キャンセルで基準値は変わらない", app.worker.baseline is baseline_before))
+
+    # ②'' 確認画面で「やり直す」: 名前も尋ねず、保存されず、基準値も変わらない
+    asked = []
+    app._ask_calibration_name = lambda: asked.append(1) or "名前"
+    app._confirm_calibration = lambda o: False
+    app._handle_calib_outcome(outcome)
+    results.append(("やり直しでは名前を尋ねず保存しない",
+                    not asked and len(db.saved_baselines) == saved_before))
+    results.append(("やり直しで基準値は変わらない", app.worker.baseline is baseline_before))
+    results.append(("確認が終われば通常の処理に戻る", app._reviewing is False))
+
+    # ②''' 確認中の点数は記録も通知もしない（まだ古い基準値で採点した点数なので捨てる）
+    app.result_queue = queue.Queue()
+    app.result_queue.put(WorkerResult("f", None, 50.0, 7))
+    updates_before, scores_before = len(notifier.updates), len(db.saved_scores)
+    app._reviewing = True
+    app.on_tick()
+    app._reviewing = False
+    results.append(("確認中の点数は捨てる",
+                    app.result_queue.empty() and len(notifier.updates) == updates_before
+                    and len(db.saved_scores) == scores_before))
+    app.result_queue = None
 
     # ③ 撮影ON/OFF: 停止でワーカーを止め、撮影フラグが下りて worker が外れる
     app.capturing = True

@@ -99,6 +99,22 @@ def _draw_pose(frame_bgr, landmarks, min_visibility):
             cv2.circle(frame_bgr, pixel(i), 4, _POINT_COLOR, -1)
 
 
+def bgr_to_pixmap(img_bgr):
+    """OpenCV の BGR フレームを Qt の QPixmap にする。
+
+    QImage は numpy のメモリを「参照」するだけ（コピーしない）ので、その場で
+    QPixmap.fromImage によりピクセルを焼き込んでしまえば、numpy 配列が解放されても安全。
+    OpenCV は BGR 並びなので Format_BGR888 を使えば色変換(cvtColor)も不要。
+    """
+    # cv2.resize の出力は連続メモリだが、念のため連続性を保証してから渡す。
+    img_bgr = np.ascontiguousarray(img_bgr)
+    h, w = img_bgr.shape[:2]
+    bytes_per_line = 3 * w
+    qimg = QImage(img_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
+    # copy() で Qt 側にピクセルを持たせ、numpy のバッファ寿命から切り離す。
+    return QPixmap.fromImage(qimg.copy())
+
+
 class LiveView(QWidget):
     """映像＋骨格＋スコアを表示するウィジェット部品。
 
@@ -143,11 +159,14 @@ class LiveView(QWidget):
         self._pixmap = None
 
     # ── 表示更新（app_window の on_tick から呼ばれる） ──
-    def update_view(self, frame_bgr, landmarks, score, advice=None):
-        """最新フレーム＋33点＋スコア（＋改善提案）で表示を差し替える。"""
+    def update_view(self, frame_bgr, landmarks, score, advice=None, status=None):
+        """最新フレーム＋33点＋スコア（＋改善提案）で表示を差し替える。
+
+        status … スコアの代わりに出す文言（測定中など。省略時はスコアを出す）。
+        """
         # フレームが無ければ描画をスキップ（古い表示のまま）。
         if frame_bgr is None:
-            self._update_score(score, detected=landmarks is not None)
+            self._update_score(score, detected=landmarks is not None, status=status)
             self._update_advice(advice)
             return
 
@@ -159,32 +178,19 @@ class LiveView(QWidget):
             _draw_pose(img, landmarks, self.min_visibility)
 
         # Qt 用の画像に変換し、参照を保持して差し替える。
-        pixmap = self._to_pixmap(img)
+        pixmap = bgr_to_pixmap(img)
         self._image_label.setPixmap(pixmap)
         self._pixmap = pixmap  # ← 必ず保持
 
-        self._update_score(score, detected=landmarks is not None and len(landmarks) > 0)
+        self._update_score(score, detected=landmarks is not None and len(landmarks) > 0,
+                           status=status)
         self._update_advice(advice)
 
-    # ── 画像変換（表示先=Qt に合わせる） ──
-    def _to_pixmap(self, img_bgr):
-        """OpenCV の BGR フレームを Qt の QPixmap にする。
-
-        QImage は numpy のメモリを「参照」するだけ（コピーしない）ので、その場で
-        QPixmap.fromImage によりピクセルを焼き込んでしまえば、numpy 配列が解放されても安全。
-        OpenCV は BGR 並びなので Format_BGR888 を使えば色変換(cvtColor)も不要。
-        """
-        # cv2.resize の出力は連続メモリだが、念のため連続性を保証してから渡す。
-        img_bgr = np.ascontiguousarray(img_bgr)
-        h, w = img_bgr.shape[:2]
-        bytes_per_line = 3 * w
-        qimg = QImage(img_bgr.data, w, h, bytes_per_line, QImage.Format_BGR888)
-        # copy() で Qt 側にピクセルを持たせ、numpy のバッファ寿命から切り離す。
-        return QPixmap.fromImage(qimg.copy())
-
     # ── スコア表示（色分け＋状態表示） ──
-    def _update_score(self, score, detected):
-        if score is None:
+    def _update_score(self, score, detected, status=None):
+        if status is not None:
+            text, color = status, _COLOR_IDLE
+        elif score is None:
             # 採点不可。検出の有無で文言を分け、古いスコアを残さない。
             if not detected:
                 text, color = "検出なし（席を外していませんか）", _COLOR_IDLE

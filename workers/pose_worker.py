@@ -24,6 +24,8 @@ import queue
 import threading
 from collections import namedtuple
 
+import cv2
+
 # workers/ から実行されても、パッケージ import でも config / core を読めるように。
 try:
     import config
@@ -43,15 +45,21 @@ except ModuleNotFoundError:
 # advice     … 改善提案の文言（悪姿勢時のみ） ／ 提案不要なら None。
 # timestamp  … そのフレームの時刻[ms]（記録・整合の参考）。
 # deviations … 特徴ごとの符号付きずれ {名前: 値 or None}（傾向分析の記録用） ／ 採点不可なら None。
+# measuring  … キャリブレーション測定中のフレームか（採点はしないので score は None）。
 WorkerResult = namedtuple(
-    "WorkerResult", ["frame", "landmarks", "score", "advice", "timestamp", "deviations"]
+    "WorkerResult", ["frame", "landmarks", "score", "advice", "timestamp", "deviations", "measuring"],
+    defaults=[False],
 )
 
 # キャリブレーション測定の結果（ワーカー→メイン）。保存(DB)はメインが行う。
 # frames … 測定中に検出した全フレームの生の座標（DB の landmarks に baseline と一緒に保存する）。
+# review_frame … 確認画面に出す画像と座標 {"image", "points", "sample"}（基準値に最も近いフレーム）。
+# warnings … 基準値が目安を外れたときの警告文のリスト（check_baseline の出力）。
 CalibrationOutcome = namedtuple(
     "CalibrationOutcome",
-    ["success", "user_id", "representative", "num_samples", "message", "frames"]
+    ["success", "user_id", "representative", "num_samples", "message", "frames",
+     "review_frame", "warnings"],
+    defaults=[None, ()],
 )
 
 # 連続でフレーム取得に失敗したらカメラ切断とみなして安全に抜ける。
@@ -229,10 +237,24 @@ class PoseWorker(threading.Thread):
 
         DB保存・メモリ基準値の更新はメインが行う（DBに触るのはメインだけ）。
         """
+        candidates = []  # 確認画面の候補。全枚残すと約415MBになるので間引いて縮小する
+        good_count = 0
+
+        def on_frame(frame, landmarks, sample, timestamp_ms):
+            nonlocal good_count
+            # 測定中も映像を流す（本人が姿勢を見ながら測れるように）。採点はしない。
+            self._put_latest(WorkerResult(frame, landmarks, None, None, timestamp_ms, None,
+                                          measuring=True))
+            if sample is not None:
+                if good_count % config.REVIEW_FRAME_EVERY == 0:
+                    candidates.append({"image": cv2.resize(frame, config.LIVE_DISPLAY_SIZE),
+                                       "points": landmarks, "sample": sample})
+                good_count += 1
+
         # タイムスタンプは採点ループと同じ単調増加カウンタを使う（推定器を共有するため、
         # 0 にリセットすると VIDEO モードが「時刻が逆戻り」でエラーになる）。
         good_samples, total, raw_frames = calibration.collect_samples(
-            self._camera, self._estimator, timestamp_fn=self._next_timestamp)
+            self._camera, self._estimator, timestamp_fn=self._next_timestamp, on_frame=on_frame)
         if len(good_samples) < config.MIN_GOOD_SAMPLES:
             self.calib_result_queue.put(CalibrationOutcome(
                 success=False, user_id=user_id, representative=None,
@@ -249,6 +271,8 @@ class PoseWorker(threading.Thread):
             success=True, user_id=user_id, representative=representative,
             num_samples=len(good_samples), message="キャリブレーション完了。",
             frames=raw_frames,
+            review_frame=calibration.pick_review_frame(candidates, representative),
+            warnings=calibration.check_baseline(representative),
         ))
 
     # ── 結果をキューへ（映像は最新だけ・あふれたら古いものを捨てる、メモ §4/§14） ──
@@ -341,19 +365,27 @@ def _self_test():
         # キャリブレーションをワーカー経由で要求 → カメラを奪い合わずに完了。
         worker.request_calibration(user_id=1)
         outcome = None
+        saw_measuring = False
         deadline = time.time() + 3.0
         while time.time() < deadline:
             # ワーカーがブロックしないよう、結果キューは引き続き空にしておく。
             try:
-                result_q.get_nowait()
+                item = result_q.get_nowait()
+                saw_measuring = saw_measuring or (item.measuring and item.score is None)
             except queue.Empty:
                 pass
             try:
-                outcome = worker.calib_result_queue.get(timeout=0.1)
+                outcome = worker.calib_result_queue.get(timeout=0.01)
                 break
             except queue.Empty:
                 pass
         results.append(("キャリブがワーカー経由で完了", outcome is not None and outcome.success))
+        results.append(("測定中も映像が流れる（採点はしない）", saw_measuring))
+        review = outcome.review_frame if outcome is not None else None
+        results.append(("確認画面の画像は表示サイズに縮小される",
+                        review is not None and review["image"].shape[1::-1] == config.LIVE_DISPLAY_SIZE))
+        results.append(("基準値の警告が結果に付く",
+                        outcome is not None and isinstance(outcome.warnings, list)))
 
         # 生の座標が残り、そこから特徴量を再計算すると基準値と一致する（landmarks 保存の目的そのもの）。
         frames = outcome.frames if outcome is not None else None

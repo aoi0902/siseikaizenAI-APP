@@ -123,6 +123,30 @@ SMOOTH_WINDOW = 10  # 平均をとる直近フレーム数（≒30fps で約 0.3
 CALIBRATION_SECONDS = 5       # 正しい姿勢をキープして測定する秒数
 MIN_GOOD_SAMPLES = 30         # 基準値を作るのに必要な「良いフレーム」の最低数
 STABILIZE_METHOD = "median"   # 安定化の方法。"median"（外れ値に強い・推奨）/ "mean"
+REVIEW_FRAME_EVERY = 10       # 確認画面の候補に残す間隔（良いフレーム N 枚に 1 枚。全部残すとメモリを使いすぎる）
+
+# 測定後の確認画面で使う基準値の目安 (下限, 上限)。None はその側を判定しない。
+# 外れても保存は止めず、警告するだけ（特徴量の式の限界で neck≦90°・trunk≧0°・kyphosis≦180° なので片側で足りる）。
+# ★ 仮の値。実験Bの「良い姿勢／猫背」のデータで決め直す。
+_SIDE_CALIBRATION_RANGES = {
+    "neck_angle": (55.0, None),
+    "trunk_angle": (None, 15.0),
+    "kyphosis_angle": (150.0, None),
+}
+_FRONT_CALIBRATION_RANGES = {
+    "shoulder_tilt": (None, 8.0),
+    "head_tilt": (None, 8.0),
+}
+CALIBRATION_RANGES = _by_mode(_SIDE_CALIBRATION_RANGES, _FRONT_CALIBRATION_RANGES)
+
+# 確認画面に出す特徴量の呼び名。
+FEATURE_LABELS = {
+    "neck_angle": "首の前傾",
+    "trunk_angle": "体幹の傾き",
+    "kyphosis_angle": "上体屈曲角",
+    "shoulder_tilt": "肩の左右の傾き",
+    "head_tilt": "頭の左右の傾き",
+}
 
 
 # ── データベース設定（db/database.py が参照） ──
