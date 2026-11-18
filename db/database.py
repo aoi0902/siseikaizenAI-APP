@@ -11,6 +11,7 @@ SQL は全部このファイルに閉じ込め、他のファイルは名前の�
   - SQLite への接続・切断 / テーブル作成（冪等）
   - baseline（基準値）の保存・取得
   - scores（スコア）の保存・取得
+  - sessions（計測の回）の開始・終了の記録と取得
   - プレーンなデータ（数値・文字列・dict の一覧）を返す
 
 担わないこと:
@@ -87,7 +88,7 @@ def _connect():
 
 # ── 初期化（冪等） ──
 def ensure_tables():
-    """4 テーブル（users / baseline / scores / landmarks）を「無ければ作る」。起動のたびに呼んでも壊れない。"""
+    """5 テーブル（users / baseline / scores / sessions / landmarks）を「無ければ作る」。起動のたびに呼んでも壊れない。"""
     feature_cols = [_check_identifier(c) for c in _feature_columns()]
     # baseline の特徴量カラムを config から組み立てる（REAL・NULL許容）。
     feature_ddl = "".join(f"    {c} REAL,\n" for c in feature_cols)
@@ -124,6 +125,18 @@ def ensure_tables():
                 user_id INTEGER NOT NULL,
                 timestamp TEXT NOT NULL,
                 score REAL NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+            """
+        )
+        # 計測の回（開始〜終了）を記録する表
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
@@ -182,6 +195,8 @@ def _ensure_score_columns(conn):
     傾向分析では、点数だけで出せる指標には使い、崩れ方の内訳からは除外する。
     """
     existing = [r["name"] for r in conn.execute("PRAGMA table_info(scores)").fetchall()]
+    if "session_id" not in existing:
+        conn.execute("ALTER TABLE scores ADD COLUMN session_id INTEGER")
     for name in _feature_columns():
         col = _deviation_column(name)
         if col not in existing:
@@ -406,7 +421,8 @@ def get_latest_baseline(user_id):
 
 
 # ── スコア（scores） ──
-def save_score(user_id, timestamp, score, deviations=None, landmarks=None, image_size=None):
+def save_score(user_id, timestamp, score, deviations=None, landmarks=None, image_size=None,
+               session_id=None):
     """スコアを 1 件記録する。戻り値は追加した行の id。
 
     deviations … {特徴名: 符号付きずれ or None}（scoring.deviations の出力・任意）。
@@ -414,6 +430,7 @@ def save_score(user_id, timestamp, score, deviations=None, landmarks=None, image
     landmarks  … その瞬間の33点（記録モードのときだけ渡す）。scores と同じトランザクションで
                  landmarks に保存し、score_id で対応づける
     image_size … (幅, 高さ)。landmarks を渡すときは必須（縦横比の補正を後から再現するため）
+    session_id … 何回目の計測のスコアか（start_session の戻り値・任意）
     """
     if landmarks is not None and image_size is None:
         raise ValueError("landmarks を保存するときは image_size (幅, 高さ) が必要です。")
@@ -424,8 +441,8 @@ def save_score(user_id, timestamp, score, deviations=None, landmarks=None, image
     conn = _connect()
     try:
         cur = conn.execute(
-            f"INSERT INTO scores (user_id, timestamp, score, {cols}) VALUES (?, ?, ?, {marks})",
-            (user_id, timestamp, score, *(deviations.get(n) for n in names)),
+            f"INSERT INTO scores (user_id, timestamp, score, session_id, {cols}) VALUES (?, ?, ?, ?, {marks})",
+            (user_id, timestamp, score, session_id, *(deviations.get(n) for n in names)),
         )
         score_id = cur.lastrowid
         if landmarks is not None:
@@ -445,7 +462,7 @@ def get_scores(user_id, start=None, end=None):
     戻り値      … [{"timestamp": ..., "score": ..., "dev_<特徴名>": ... or None}, ...]
     """
     dev_cols = "".join(f", {_deviation_column(n)}" for n in _feature_columns())
-    sql = f"SELECT timestamp, score{dev_cols} FROM scores WHERE user_id = ?"
+    sql = f"SELECT timestamp, score, session_id{dev_cols} FROM scores WHERE user_id = ?"
     params = [user_id]
     if start is not None:
         sql += " AND timestamp >= ?"
@@ -458,6 +475,47 @@ def get_scores(user_id, start=None, end=None):
     conn = _connect()
     try:
         rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── 計測の回（sessions） ──
+def start_session(user_id, started_at):
+    """計測の開始を記録する。戻り値は回の id。"""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO sessions (user_id, started_at) VALUES (?, ?)",
+            (user_id, started_at),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def end_session(session_id, ended_at):
+    """計測の終了を記録する。"""
+    conn = _connect()
+    try:
+        conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (ended_at, session_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_sessions(user_id):
+    """計測の回を古い順に返す（集計はしない）。"""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, started_at, ended_at FROM sessions WHERE user_id = ? ORDER BY id ASC",
+            (user_id,),
+        ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -477,7 +535,7 @@ def _self_test():
     config.USE_FEATURES = ["neck_angle", "trunk_angle"]
     try:
         ensure_tables()
-        print("ensure_tables: 4テーブル作成 OK")
+        print("ensure_tables: 5テーブル作成 OK")
 
         uid = get_or_create_user("テストユーザー")
         uid2 = get_or_create_user("テストユーザー")  # 二度目は作らず同じid
@@ -565,6 +623,15 @@ def _self_test():
         assert get_landmark_frames(uid, source="calibration") == []
         assert len(get_landmark_frames(uid, source="scoring")) == 1
         print("landmarks: 保存（キャリブ・採点）・6桁丸め・読み戻し・連動削除 OK")
+
+        # 計測の回: 開始 → スコアに番号 → 終了 → 読める
+        sid2 = start_session(uid, "2026-06-23 09:00:00")
+        save_score(uid, "2026-06-23 09:00:05", 88.0, session_id=sid2)
+        end_session(sid2, "2026-06-23 09:10:00")
+        sessions = get_sessions(uid)
+        assert sessions[-1]["id"] == sid2 and sessions[-1]["ended_at"] == "2026-06-23 09:10:00"
+        assert get_scores(uid)[-1]["session_id"] == sid2
+        print("sessions: 開始・終了・スコアの紐づけ OK")
 
         print("DB 自己テスト: すべて OK")
     finally:

@@ -10,6 +10,7 @@
   - Qt のイベントループを回し、QTimer でキューを取り出して各部品へ配る
   - 起動と終了の段取り（ワーカー開始・停止フラグ・join・解放）
   - DB を持ち、スコアを記録させる
+  - 計測の回（撮影開始〜停止）の開始・終了を DB に記録させる
 
 担わないこと:
   - 骨格の描画 → live_view / グラフ → feedback_view
@@ -146,6 +147,8 @@ class AppWindow:
         self.live_view = None
         self.calibration_view = None
         self.feedback_view = None
+        self.feedback_avg_view = None  # フィードバック画面の「回ごとの平均」グラフ
+        self.trend_avg_view = None     # 傾向フィードバック画面の「回ごとの平均」グラフ
         self.session_view = None  # 今回のスコア推移グラフ
         self.score_label = None
         self.capture_button = None  # 撮影 ON/OFF トグル
@@ -156,6 +159,7 @@ class AppWindow:
         self.result_queue = None
         self.worker = None
         self.user_id = None
+        self.session_id = None    # 今の計測の回（撮影中だけ値が入る）
         self.baseline = None      # 現在の基準値（メモリ。撮影ONのたびワーカーへ渡す）
         self.timer = None         # on_tick を回す QTimer（root.after の置き換え）
 
@@ -201,6 +205,9 @@ class AppWindow:
         self.worker = PoseWorker(result_queue=self.result_queue, baseline=self.baseline)
         self.worker.start()
         self.capturing = True
+        # 計測の回を開始する（このあと保存するスコアにこの番号を付ける）。
+        started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.session_id = self.database.start_session(self.user_id, started_at)
         self._update_capture_button()
 
     def stop_capture(self):
@@ -211,6 +218,11 @@ class AppWindow:
             self.worker = None
         self.result_queue = None
         self.capturing = False
+        # 計測の回を閉じる（開始していなければ何もしない）。
+        if self.session_id is not None:
+            ended_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.database.end_session(self.session_id, ended_at)
+            self.session_id = None
         # 停止中と分かるよう表示を落ち着かせる。
         if self.score_label is not None:
             self.score_label.setText("撮影停止中")
@@ -238,7 +250,7 @@ class AppWindow:
         """QApplication・ウィンドウ・各画面を作り、閉じるフックを付ける。
 
         画面は QStackedWidget で 3 枚を切り替える:
-          ホーム（メニュー）／撮影（映像・スコア・今回グラフ）／フィードバック（日次グラフ）。
+          ホーム（メニュー）／撮影（映像・スコア・今回グラフ）／フィードバック（過去の計測グラフ）。
         起動直後はホームを表示し、そこから撮影・フィードバックを選ぶ。
         """
         import sys
@@ -408,19 +420,34 @@ class AppWindow:
 
     # ── フィードバック画面 ──
     def _build_feedback_page(self):
-        """日次スコアグラフ＋ホームへ戻るボタンを作って返す。"""
+        """過去の計測のスコアグラフ＋ホームへ戻るボタンを作って返す。"""
+        from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton
-        from feedback_view import FeedbackView
+        from feedback_view import FeedbackView, AverageChartView
 
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        # フィードバック: 日次グラフ（重いので更新時だけ描く）
+        # 更新ボタン（2つのグラフをまとめて更新する）。
+        btn_refresh = QPushButton("グラフを更新")
+        btn_refresh.clicked.connect(self.on_refresh_feedback)
+        layout.addWidget(btn_refresh, alignment=Qt.AlignCenter)
+
+        # 上: 回ごとの平均（背の低いグラフ。「前の回より良くなったか」を見る）
+        self.feedback_avg_view = AverageChartView(
+            get_scores=lambda: self.database.get_scores(self.user_id),
+            get_sessions=lambda: self.database.get_sessions(self.user_id),
+        )
+        layout.addWidget(self.feedback_avg_view, 1)   # 背は低め（伸びる割合 1）
+
+        # 下: 過去の計測（直近10回）のグラフ（重いので更新時だけ描く）
         self.feedback_view = FeedbackView(
             get_scores=lambda: self.database.get_scores(self.user_id),
+            get_sessions=lambda: self.database.get_sessions(self.user_id),
             on_refresh=self.on_refresh_feedback,
+            show_button=False,   # ボタンはページの一番上に置いたので、ここでは出さない
         )
-        layout.addWidget(self.feedback_view)
+        layout.addWidget(self.feedback_view, 2)       # こちらを大きめに（伸びる割合 2）
 
         btn_home = QPushButton("ホームへ戻る")
         btn_home.setMinimumHeight(36)
@@ -447,6 +474,14 @@ class AppWindow:
         btn_generate.setMinimumHeight(44)
         btn_generate.clicked.connect(self.on_generate_trend)
         layout.addWidget(btn_generate)
+
+        # 文章の上に、回ごとの平均グラフを置く（文章の数字と見比べられるように）。
+        from feedback_view import AverageChartView
+        self.trend_avg_view = AverageChartView(
+            get_scores=lambda: self.database.get_scores(self.user_id),
+            get_sessions=lambda: self.database.get_sessions(self.user_id),
+        )
+        layout.addWidget(self.trend_avg_view)
 
         # 結果の文章（折り返し・選択コピー可）。
         self.trend_label = QLabel("「フィードバックを生成」を押してください。")
@@ -512,13 +547,14 @@ class AppWindow:
         self.stack.setCurrentWidget(self.capture_page)
 
     def go_feedback(self):
-        """フィードバック画面へ。最新データで日次グラフを描き直してから表示する。"""
-        if self.feedback_view is not None:
-            self.feedback_view.refresh()
+        """フィードバック画面へ。最新データでグラフを描き直してから表示する。"""
+        self.on_refresh_feedback()
         self.stack.setCurrentWidget(self.feedback_page)
 
     def go_trend(self):
-        """傾向フィードバック画面へ（生成は利用者がボタンを押したときだけ）。"""
+        """傾向フィードバック画面へ（文章の生成は利用者がボタンを押したときだけ）。"""
+        if self.trend_avg_view is not None:
+            self.trend_avg_view.refresh()   # グラフは開いたときに最新にする
         self.stack.setCurrentWidget(self.trend_page)
 
     def go_manage(self):
@@ -699,7 +735,8 @@ class AppWindow:
                     # 内訳（特徴ごとのずれ）も一緒に残す → 傾向フィードバックで使う。
                     self.database.save_score(self.user_id, ts, item.score,
                                              deviations=item.deviations,
-                                             landmarks=landmarks, image_size=image_size)
+                                             landmarks=landmarks, image_size=image_size,
+                                             session_id=self.session_id)
 
             last = item
         return last
@@ -844,7 +881,9 @@ class AppWindow:
 
     # ── グラフ更新（重いので更新時だけ） ──
     def on_refresh_feedback(self):
-        """フィードバックの更新要求 → feedback_view に再集計・再描画を依頼。"""
+        """フィードバックの更新要求 → 2つのグラフに再集計・再描画を依頼。"""
+        if self.feedback_avg_view is not None:
+            self.feedback_avg_view.refresh()
         if self.feedback_view is not None:
             self.feedback_view.refresh()
 
@@ -863,6 +902,8 @@ class AppWindow:
         start = (now - timedelta(days=2 * config.TREND_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
         rows = self.database.get_scores(self.user_id, start=start)
         text = trend.generate(rows, now)
+        if self.trend_avg_view is not None:
+            self.trend_avg_view.refresh()
         if self.trend_label is not None:
             self.trend_label.setText(f"{now:%Y-%m-%d %H:%M} 生成\n\n{text}")
         return text
@@ -884,6 +925,7 @@ class AppWindow:
         if self.session_view is not None:
             self.session_view.stop()
         # 撮影中ならワーカーを止めてカメラを解放する（停止中なら何もしない）。
+        # 計測の回もここで閉じる（stop_capture の中で終了を記録する）。
         self.stop_capture()
         # database は操作ごとに接続を開閉する設計なので、閉じるべき常設接続は無い。
 
@@ -907,13 +949,21 @@ def _self_test():
         def __init__(self):
             self.saved_scores = []
             self.saved_baselines = []
+            self.sessions = []   # 計測の回の記録（開始・終了）
         def ensure_tables(self): pass
         def get_or_create_user(self, name): return 1
         def get_latest_baseline(self, uid):
             return {"neck_angle": 10.0, "shoulder_tilt": 0.0} if self.saved_baselines else None
-        def save_score(self, uid, ts, score, deviations=None, landmarks=None, image_size=None):
-            self.saved_scores.append((uid, ts, score, deviations, landmarks, image_size))
+        def save_score(self, uid, ts, score, deviations=None, landmarks=None, image_size=None,
+                       session_id=None):
+            self.saved_scores.append((uid, ts, score, deviations, landmarks, image_size, session_id))
         def get_scores(self, uid, start=None, end=None): return []
+        def get_sessions(self, uid): return []
+        def start_session(self, uid, ts):
+            self.sessions.append({"started": ts, "ended": None})
+            return len(self.sessions)   # 回の id（1から）
+        def end_session(self, sid, ts):
+            self.sessions[sid - 1]["ended"] = ts
         def save_baseline(self, uid, rep, ts, name=None, frames=None):
             self.saved_baselines.append((uid, rep, ts, name))
             self.saved_frames = frames
@@ -974,6 +1024,13 @@ def _self_test():
                     db.saved_scores[-1][4] == ["LM"] * 33 and db.saved_scores[-1][5] == (640, 480)))
     app._on_toggle_recording(False)
 
+    # ①-3 スコアに計測の回の番号が付く（次の1件で記録されるよう間引きカウンタを進める）
+    app.session_id = 7
+    app._score_counter = 2
+    app._dispatch_results([WorkerResult("f6", None, 50.0, 6)])
+    results.append(("スコアに計測の回の番号が付く", db.saved_scores[-1][6] == 7))
+    app.session_id = None
+
     # ①' 傾向フィードバック: 記録が無くても落ちず、不足の案内を返す
     results.append(("傾向生成(記録なし)で案内文", "足りません" in app.on_generate_trend()))
 
@@ -1022,10 +1079,12 @@ def _self_test():
 
     # ③ 撮影ON/OFF: 停止でワーカーを止め、撮影フラグが下りて worker が外れる
     app.capturing = True
+    app.session_id = db.start_session(1, "2026-06-22 09:00:00")   # 計測の回が始まっている状態
     worker_ref = app.worker              # stop_capture が worker を None にするので控えておく
     app.stop_capture()
     results.append(("撮影OFFで停止フラグ＋join", worker_ref.stopped and worker_ref.joined))
     results.append(("撮影OFFで撮影フラグが下りる", app.capturing is False and app.worker is None))
+    results.append(("撮影OFFで計測の回が閉じる", db.sessions[0]["ended"] is not None and app.session_id is None))
 
     # ④ 終了手順: 停止中に閉じても安全（二重停止しない）
     app.on_close()
